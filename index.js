@@ -1,63 +1,145 @@
 
 require('dotenv').config();
 
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason
+} = require('@whiskeysockets/baileys');
+
 const qrcode = require('qrcode-terminal');
+const pino = require('pino');
+const path = require('path');
 
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  }
-});
+const DRY_RUN = true;
+const AUTH_DIR = path.join(__dirname, 'auth_info_baileys');
 
-const DRY_RUN = process.env.DRY_RUN !== 'false';
-
-const adWords = [
-  'للإعلان', 'اعلان', 'إعلان',
-  'تسويق', 'تواصل خاص', 'اشترك',
-  'متوفر للبيع', 'خصم', 'عرض خاص'
+const promotionWords = [
+  'للإعلان', 'اعلان', 'إعلان', 'تسويق',
+  'متوفر للبيع', 'خصم', 'عرض خاص',
+  'اشترك', 'اطلب الآن', 'للطلب', 'للحجز'
 ];
 
-function isAdvertisement(message) {
-  const text = message.body.toLowerCase();
+const contactWords = [
+  'تواصل', 'راسل', 'واتساب', 'خاص',
+  'اتصل', 'للطلب', 'للحجز', 'احجز'
+];
 
-  const hasAdWord = adWords.some(word =>
-    text.includes(word.toLowerCase())
-  );
+function getMessageText(message) {
+  const content = message.message || {};
 
-  const hasLink = /https?:\/\/|www\./i.test(text);
-
-  return hasAdWord || (hasLink && hasAdWord);
+  return (
+    content.conversation ||
+    content.extendedTextMessage?.text ||
+    content.imageMessage?.caption ||
+    content.videoMessage?.caption ||
+    content.documentMessage?.caption ||
+    ''
+  ).trim();
 }
 
-client.on('qr', qr => {
-  console.log('امسح رمز QR لربط رقم البوت:');
-  qrcode.generate(qr, { small: true });
-});
+function isAdvertisement(text) {
+  const normalized = text.toLowerCase();
 
-client.on('ready', () => {
-  console.log('البوت متصل وجاهز للمراقبة.');
-  console.log('وضع التجربة:', DRY_RUN);
-});
+  const hasPromotion = promotionWords.some(word =>
+    normalized.includes(word.toLowerCase())
+  );
 
-client.on('message', async message => {
-  try {
-    const chat = await message.getChat();
+  const hasContact = contactWords.some(word =>
+    normalized.includes(word.toLowerCase())
+  );
 
-    if (!chat.isGroup || message.fromMe) return;
+  const hasLink = /https?:\/\/|www\./i.test(normalized);
 
-    if (isAdvertisement(message)) {
-      console.log('تم رصد رسالة قد تكون إعلاناً في:', chat.name);
+  return hasPromotion && (hasContact || hasLink);
+}
 
-      if (DRY_RUN) {
+async function startBot() {
+  const { state, saveCreds } =
+    await useMultiFileAuthState(AUTH_DIR);
+
+  const sock = makeWASocket({
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    browser: ['Student Group Guard', 'Chrome', '1.0.0'],
+    markOnlineOnConnect: false,
+    syncFullHistory: false
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async update => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log('امسح رمز QR لربط رقم البوت:');
+      qrcode.generate(qr, { small: true });
+    }
+
+    if (connection === 'open') {
+      console.log('البوت متصل وجاهز للمراقبة.');
+      console.log('وضع التجربة مفعل: لا حذف ولا طرد.');
+    }
+
+    if (connection === 'close') {
+      const statusCode =
+        lastDisconnect?.error?.output?.statusCode;
+
+      if (statusCode === DisconnectReason.loggedOut) {
+        console.log('تم تسجيل الخروج. تحتاج إلى ربط الرقم مجدداً.');
+        return;
+      }
+
+      console.log('انقطع الاتصال، إعادة المحاولة بعد قليل...');
+      setTimeout(() => startBot().catch(console.error), 5000);
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const message of messages) {
+      try {
+        const groupId = message.key.remoteJid;
+
+        if (
+          !groupId ||
+          !groupId.endsWith('@g.us') ||
+          message.key.fromMe
+        ) continue;
+
+        const text = getMessageText(message);
+
+        if (!text || !isAdvertisement(text)) continue;
+
+        const sender = message.key.participant;
+        if (!sender) continue;
+
+        let metadata;
+
+        try {
+          metadata = await sock.groupMetadata(groupId);
+        } catch {
+          console.log('تعذر التحقق من مشرفي المجموعة. تم تجاهل الرسالة.');
+          continue;
+        }
+
+        const participant = metadata.participants.find(
+          member => member.id === sender
+        );
+
+        if (participant?.admin) continue;
+
+        console.log('تم رصد رسالة يُحتمل أنها إعلان.');
+        console.log('المجموعة:', metadata.subject);
+        console.log('المرسل:', sender);
         console.log('وضع التجربة: لم يتم حذف الرسالة أو طرد العضو.');
+
+      } catch (error) {
+        console.error('خطأ أثناء فحص الرسالة:', error.message);
       }
     }
-  } catch (error) {
-    console.error('خطأ:', error.message);
-  }
-});
+  });
+}
 
-client.initialize();
+startBot().catch(console.error);
